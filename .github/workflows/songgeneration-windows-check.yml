@@ -1,0 +1,84 @@
+name: SongGeneration Windows compatibility check
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/songgeneration-windows-check.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-check:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Prepare report folder and machine details
+        run: |
+          New-Item -ItemType Directory reports -Force | Out-Null
+          python --version | Out-File reports/environment.txt
+          python -m pip --version | Out-File reports/pip-version.txt
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version | Out-String | Add-Content reports/environment.txt
+      - name: Get original code and Windows integration
+        run: |
+          git clone --depth 1 https://github.com/levo-demo/LeVo.git upstream-LeVo
+          git clone --depth 1 https://github.com/smthemex/ComfyUI_SongGeneration.git windows-reference
+          git -C upstream-LeVo rev-parse HEAD | Out-File reports/levo-commit.txt
+          git -C windows-reference rev-parse HEAD | Out-File reports/comfyui-commit.txt
+      - name: Check Python syntax and available interfaces
+        run: |
+          python -m compileall -q upstream-LeVo
+          if ($LASTEXITCODE -ne 0) { throw 'LeVo Python syntax check failed' }
+          python -m compileall -q windows-reference
+          if ($LASTEXITCODE -ne 0) { throw 'ComfyUI Python syntax check failed' }
+          Get-ChildItem upstream-LeVo -Recurse -Filter '*.py' | Select-String -Pattern 'flash_attn|triton|cuda|low_mem|not_use_flash_attn' | Select-Object -First 250 | Out-File reports/platform-references.txt
+          Copy-Item upstream-LeVo/requirements.txt reports/upstream-requirements.txt
+          Copy-Item upstream-LeVo/requirements_nodeps.txt reports/upstream-requirements-nodeps.txt
+          Copy-Item windows-reference/requirements.txt reports/comfyui-requirements.txt
+      - name: Validate Windows Python dependencies
+        run: |
+          # This runner has no NVIDIA GPU: use CPU Torch for compatibility checks only.
+          python -m venv .wincheck
+          $py = '.\.wincheck\Scripts\python.exe'
+          & $py -m pip install --upgrade pip setuptools wheel
+          if ($LASTEXITCODE -ne 0) { throw 'pip bootstrap failed' }
+          & $py -m pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          if ($LASTEXITCODE -ne 0) { throw 'Windows Torch installation failed' }
+          & $py -m pip install -r upstream-LeVo/requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Upstream dependencies failed on Windows' }
+          # Original LeVo pins Hydra 1.0.7 and OmegaConf 2.2.0, which conflict.
+          # Patch just our CI copy, preserving the checked-out upstream sources.
+          $txt = Get-Content upstream-LeVo/requirements_nodeps.txt -Raw
+          $txt = $txt -replace '(?m)^hydra-core==1\.0\.7\r?$', 'hydra-core==1.3.2'
+          $txt = $txt -replace '(?m)^omegaconf==2\.2\.0\r?$', 'omegaconf==2.3.0'
+          $txt = $txt -replace '(?m)^antlr4-python3-runtime==4\.8\r?$', 'antlr4-python3-runtime==4.9.3'
+          Set-Content reports/requirements-nodeps-compatible.txt $txt
+          & $py -m pip install --no-deps -r reports/requirements-nodeps-compatible.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Patched dependencies failed on Windows' }
+          & $py -m pip check 2>&1 | Tee-Object reports/pip-check.txt
+          if ($LASTEXITCODE -ne 0) { throw 'pip dependency conflicts remain' }
+          & $py -m pip freeze | Out-File reports/pip-freeze.txt
+          & $py -c "import torch, torchaudio, transformers, diffusers; print('torch',torch.__version__,'CUDA',torch.cuda.is_available());print('transformers',transformers.__version__);print('diffusers',diffusers.__version__)" 2>&1 | Tee-Object reports/import-test.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Basic dependency imports failed' }
+      - name: Package Windows compatibility reports
+        if: always()
+        run: |
+          Compress-Archive -Path reports\* -DestinationPath songgeneration-windows-reports.zip -Force
+      - name: Upload Windows compatibility reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: songgeneration-windows-compatibility
+          path: songgeneration-windows-reports.zip
+          retention-days: 7
+          if-no-files-found: warn
