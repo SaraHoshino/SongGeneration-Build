@@ -39,22 +39,30 @@ jobs:
       - name: Verify Linux dependency installation (CPU-only torch)
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           python -m pip install --upgrade pip wheel setuptools
           python -m pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -r upstream-LeVo/requirements.txt
-          python -m pip install --no-deps -r upstream-LeVo/requirements_nodeps.txt
-          # Resolve hydra-core 1.0.x vs OmegaConf 2.2.x incompatibility in the upstream dependency tree.
-          # This makes the dependency-check environment consistent; inference still requires GPU testing.
-          python -m pip install "hydra-core==1.3.2" "omegaconf==2.2.0"
+          # The upstream pins conflict:
+          # Hydra 1.0.7 expects OmegaConf <2.1, while upstream pins OmegaConf 2.2.0.
+          # Hydra 1.3.2 and OmegaConf 2.3.0 both require ANTLR 4.9.x.
+          # Patch only our temporary CI copy, not Tencent's files.
+          sed -e 's/^hydra-core==1[.]0[.]7$/hydra-core==1.3.2/' \
+              -e 's/^omegaconf==2[.]2[.]0$/omegaconf==2.3.0/' \
+              -e 's/^antlr4-python3-runtime==4[.]8$/antlr4-python3-runtime==4.9.3/' \
+              upstream-LeVo/requirements_nodeps.txt > reports/requirements_nodeps-compatible.txt
+          python -m pip install --no-deps -r reports/requirements_nodeps-compatible.txt
           python -m pip check | tee reports/pip-check.txt
           python -m pip freeze > reports/pip-freeze.txt
           python - <<'PY' | tee reports/import-test.txt
           import torch, torchaudio, transformers, diffusers
-          print('torch:',torch.__version__,'CUDA:',torch.cuda.is_available())
-          print('torchaudio:',torchaudio.__version__)
-          print('transformers:',transformers.__version__)
-          print('diffusers:',diffusers.__version__)
+          from hydra import compose, initialize
+          from omegaconf import OmegaConf
+          print('torch:', torch.__version__, 'CUDA:', torch.cuda.is_available())
+          print('torchaudio:', torchaudio.__version__)
+          print('transformers:', transformers.__version__)
+          print('diffusers:', diffusers.__version__)
+          print('OmegaConf:', OmegaConf.create({'status': 'ok'}))
           PY
       - name: Package local setup scripts and reports
         if: always()
