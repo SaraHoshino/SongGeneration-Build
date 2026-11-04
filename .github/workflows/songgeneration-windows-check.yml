@@ -65,6 +65,9 @@ jobs:
           Set-Content reports/requirements-nodeps-compatible.txt $txt
           & $py -m pip install --no-deps -r reports/requirements-nodeps-compatible.txt
           if ($LASTEXITCODE -ne 0) { throw 'Patched dependencies failed on Windows' }
+          # portalocker needs pywin32 on Windows, even when installed with --no-deps.
+          & $py -m pip install pywin32
+          if ($LASTEXITCODE -ne 0) { throw 'pywin32 installation failed' }
           & $py -m pip check 2>&1 | Tee-Object reports/pip-check.txt
           if ($LASTEXITCODE -ne 0) { throw 'pip dependency conflicts remain' }
           & $py -m pip freeze | Out-File reports/pip-freeze.txt
