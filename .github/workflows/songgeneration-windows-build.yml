@@ -1,0 +1,169 @@
+name: SongGeneration Windows runtime starter kit
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/songgeneration-windows-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  make-kit:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+    - name: Checkout workflow repo
+      uses: actions/checkout@v4
+    - name: Get upstream LeVo source
+      shell: pwsh
+      run: |
+        git clone --depth 1 https://github.com/levo-demo/LeVo.git kit/LeVo
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to clone upstream LeVo' }
+        git -C kit/LeVo lfs pull --include="tools/new_prompt.pt"
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to clone upstream LeVo' }
+        New-Item -ItemType Directory kit -Force | Out-Null
+        git -C kit/LeVo rev-parse HEAD | Set-Content kit/upstream-commit.txt
+    - name: Create 01-install.ps1
+      shell: pwsh
+      run: |
+        @'
+        $ErrorActionPreference = 'Stop'
+        Set-Location $PSScriptRoot
+        $pycmd = Get-Command py -ErrorAction SilentlyContinue
+        if ($pycmd) { & py -3.10 -m venv .venv } else { & python -m venv .venv }
+        if ($LASTEXITCODE -ne 0) { throw 'Python venv creation failed. Install Python 3.10 x64.' }
+        $py = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+        & $py -m pip install --upgrade pip setuptools wheel
+        if ($LASTEXITCODE -ne 0) { throw 'pip bootstrap failed' }
+        & $py -m pip install -r 'LeVo\requirements.txt'
+        if ($LASTEXITCODE -ne 0) { throw 'LeVo requirements failed' }
+        & $py -m pip install --no-deps -r 'requirements-nodeps-compatible.txt'
+        if ($LASTEXITCODE -ne 0) { throw 'LeVo extra requirements failed' }
+        & $py -m pip install pywin32 huggingface_hub
+        if ($LASTEXITCODE -ne 0) { throw 'Windows dependencies failed' }
+        # Install the GPU variant LAST, overriding any CPU Torch installed earlier.
+        & $py -m pip install --upgrade --force-reinstall torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+        if ($LASTEXITCODE -ne 0) { throw 'CUDA-enabled PyTorch installation failed' }
+        & $py -m pip check
+        if ($LASTEXITCODE -ne 0) { throw 'Dependency conflicts remain; save the output' }
+        Write-Host 'Installation finished. Next run 02-gpu-check.ps1.' -ForegroundColor Green
+        '@ | Set-Content -Path 'kit/01-install.ps1' -Encoding UTF8
+    - name: Create 02-gpu-check.ps1
+      shell: pwsh
+      run: |
+        @'
+        $ErrorActionPreference = 'Stop'
+        Set-Location $PSScriptRoot
+        $py = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+        if (!(Test-Path $py)) { throw 'Run 01-install.ps1 first' }
+        & $py -c "import torch; print('PyTorch:',torch.__version__); print('Torch CUDA:',torch.version.cuda); print('CUDA available:',torch.cuda.is_available()); print('GPU:',torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE'); print('VRAM GB:',round(torch.cuda.get_device_properties(0).total_memory/1024**3,2) if torch.cuda.is_available() else 0)"
+        if ($LASTEXITCODE -ne 0) { throw 'GPU inspection failed' }
+        Write-Host 'GPU check complete. CUDA available must be True before generation.'
+        '@ | Set-Content -Path 'kit/02-gpu-check.ps1' -Encoding UTF8
+    - name: Create 03-download-model.ps1
+      shell: pwsh
+      run: |
+        @'
+        $ErrorActionPreference = 'Stop'
+        Set-Location $PSScriptRoot
+        $py = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+        if (!(Test-Path $py)) { throw 'Run 01-install.ps1 first' }
+        # Downloads can be many GB; they are deliberately not packaged in the GitHub artifact.
+        & $py -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='lglg666/SongGeneration-Runtime', local_dir='runtime')"
+        if ($LASTEXITCODE -ne 0) { throw 'Runtime checkpoint download failed' }
+        & $py -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='lglg666/SongGeneration-base-new', local_dir='songgeneration_base_new')"
+        if ($LASTEXITCODE -ne 0) { throw 'Model download failed' }
+        foreach ($folder in @('ckpt','third_party')) {
+          $src = Join-Path $PSScriptRoot "runtime\$folder"
+          $dest = Join-Path $PSScriptRoot "LeVo\$folder"
+          if (!(Test-Path $src)) { throw "Runtime folder missing: $src" }
+          if (!(Test-Path $dest)) { Move-Item -Path $src -Destination $dest }
+        }
+        # Upstream expects the checkpoint folder in whatever --ckpt_path specifies.
+        $ckpt = Join-Path $PSScriptRoot 'songgeneration_base_new'
+        if (!(Test-Path (Join-Path $ckpt 'model.pt')) -or !(Test-Path (Join-Path $ckpt 'config.yaml'))) { throw 'model.pt or config.yaml missing in checkpoint folder' }
+        Write-Host 'Model files downloaded. Run 04-generate.ps1.' -ForegroundColor Green
+        '@ | Set-Content -Path 'kit/03-download-model.ps1' -Encoding UTF8
+    - name: Create 04-generate.ps1
+      shell: pwsh
+      run: |
+        @'
+        param([string]$InputJsonl = 'sample\lyrics.jsonl', [string]$OutputDir = 'output')
+        $ErrorActionPreference = 'Stop'
+        Set-Location $PSScriptRoot
+        $py = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
+        if (!(Test-Path $py)) { throw 'Run 01-install.ps1 first' }
+        & $py -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)"
+        if ($LASTEXITCODE -ne 0) { throw 'CUDA is unavailable. Run 02-gpu-check.ps1.' }
+        $code = Join-Path $PSScriptRoot 'LeVo'
+        $ckpt = Join-Path $PSScriptRoot 'songgeneration_base_new'
+        if (!(Test-Path (Join-Path $ckpt 'model.pt'))) { throw 'Download model weights with 03-download-model.ps1' }
+        $inputPath = if ([IO.Path]::IsPathRooted($InputJsonl)) { $InputJsonl } else { Join-Path $code $InputJsonl }
+        if (!(Test-Path $inputPath)) { throw "Input JSONL not found: $inputPath" }
+        $outputPath = if ([IO.Path]::IsPathRooted($OutputDir)) { $OutputDir } else { Join-Path $PSScriptRoot $OutputDir }
+        # Equivalent to official generate.sh ... --low_mem --not_use_flash_attn
+        $env:PYTHONDONTWRITEBYTECODE='1'
+        $env:OMP_NUM_THREADS='1'
+        $env:MKL_NUM_THREADS='1'
+        $env:PYTHONPATH= "$code;$code\codeclm\tokenizer;$code\codeclm\tokenizer\Flow1dVAE"
+        $env:TRANSFORMERS_CACHE=Join-Path $code 'third_party\hub'
+        Push-Location $code
+        try {
+          & $py generate.py --ckpt_path $ckpt --input_jsonl $inputPath --save_dir $outputPath --generate_type mixed --low_mem
+          if ($LASTEXITCODE -ne 0) { throw "Generation failed with exit code $LASTEXITCODE" }
+        } finally { Pop-Location }
+        Write-Host "Check output audio in $outputPath\audios" -ForegroundColor Green
+        '@ | Set-Content -Path 'kit/04-generate.ps1' -Encoding UTF8
+    - name: Create README-WINDOWS.txt
+      shell: pwsh
+      run: |
+        @'
+        SongGeneration native Windows experimental test kit (NOT verified to generate on NVIDIA GPU yet)
+    
+        Target: Windows 10/11, RTX 3060 12GB, Python 3.10 x64, updated NVIDIA drivers.
+        Keep this folder independent of ACE-Step, DiffRhythm, and SaraMusic.
+    
+        1. Extract this ZIP into a NEW folder, e.g. C:\AI\SongGeneration-Test.
+        2. Ensure Python 3.10 is installed, and run PowerShell scripts from that folder:
+           powershell -ExecutionPolicy Bypass -File .\01-install.ps1
+        3. Check CUDA:
+           powershell -ExecutionPolicy Bypass -File .\02-gpu-check.ps1
+        4. Download the runtime/model from Hugging Face (many GB):
+           powershell -ExecutionPolicy Bypass -File .\03-download-model.ps1
+        5. Try the example generation:
+           powershell -ExecutionPolicy Bypass -File .\04-generate.ps1
+    
+        This is an EXPERIMENTAL first-inference test, not a guaranteed Windows port.
+        Expected initial flags: --low_mem, no FlashAttention, no reference audio.
+        Note: Official base-new limit is 2m30s and listed VRAM is about 10 GB without reference audio.
+        CUDA checks only run on your PC; GitHub's Windows runner does not have an NVIDIA GPU.
+        Potential Windows-only runtime failures are still unknown.
+    
+        Original project: https://github.com/levo-demo/LeVo
+        Model: https://huggingface.co/lglg666/SongGeneration-base-new
+        Runtime: https://huggingface.co/lglg666/SongGeneration-Runtime
+        '@ | Set-Content -Path 'kit/README-WINDOWS.txt' -Encoding UTF8
+    - name: Prepare compatible pins
+      shell: pwsh
+      run: |
+        $txt = Get-Content kit/LeVo/requirements_nodeps.txt -Raw
+        $txt = $txt -replace '(?m)^hydra-core==1\.0\.7\r?$', 'hydra-core==1.3.2'
+        $txt = $txt -replace '(?m)^omegaconf==2\.2\.0\r?$', 'omegaconf==2.3.0'
+        $txt = $txt -replace '(?m)^antlr4-python3-runtime==4\.8\r?$', 'antlr4-python3-runtime==4.9.3'
+        Set-Content kit/requirements-nodeps-compatible.txt $txt
+    - name: Package Windows starter kit
+      shell: pwsh
+      run: |
+        if (!(Test-Path kit/LeVo/generate.py)) { throw 'Upstream generate.py missing' }
+        if ((Get-Item kit/LeVo/tools/new_prompt.pt).Length -lt 1000000) { throw 'new_prompt.pt appears to be a Git LFS pointer' }
+        if (!(Test-Path kit/LeVo/sample/lyrics.jsonl)) { throw 'Upstream sample input missing' }
+        Compress-Archive -Path kit/* -DestinationPath songgeneration-windows-starter-kit.zip -Force
+    - name: Upload Windows starter kit
+      uses: actions/upload-artifact@v4
+      with:
+        name: songgeneration-windows-starter-kit
+        path: songgeneration-windows-starter-kit.zip
+        retention-days: 7
+        if-no-files-found: error
